@@ -1,0 +1,256 @@
+NODE类是使用SDK调用api的节点类对象，是图论中的V
+共有 2 子类 nodes。
+
+
+========================
+全局约定（必须遵守）
+========================
+
+0. 本系统的“消息”都通过 Edge(或子边)的外部队列传递：append-only JSONL + offset。
+1. enabled / active 含义不同：
+   - enabled：是否忽略（参与性/可达性）。enabled=false 时一切判断都 skip。
+   - active：是否就绪可读（队列是否存在未消费消息）。由 offset 与队列长度决定。
+2. 运行时判定优先级（最终确认）：
+   1) enabled==false：直接 skip，视为不存在（无论 active 如何）
+   2) enabled==true 且 active==false：存在但未就绪（阻塞等待）
+   3) enabled==true 且 active==true：就绪可读；读队头消息运行；本轮结束 ack_one() 推 offset；队列空则 active=false
+3. 所有 agents 调用采用并发异步（async tasks/futures），因此“等待态实时监测”成立。
+4. 删除 SyncEdge：n 路同步由后继节点自行完成（见 Node 激活规则）。
+5. 删除“真/假输入输出列表”：不再人工维护真/假；以 edge.type 推导语义。
+   - 回滚只允许选择 edge.type==BackEdge（或 BackEdge 边组子边）。
+
+
+========================
+NODE1: workvertex / 工作点
+========================
+
+包含（建议字段）
+→ 1 个 string 节点标签
+→ 1 个 string 节点功能描述标签
+→ 1 个 bool enabled（默认=true；enabled=false 代表运行时忽略）
+→ 1 个 bool 输入确认开关（本轮消费是否确认完成）默认=false
+→ 1 个 agents 列表 (len>1)
+→ 1 个 claude SDK 指令集
+→ 1 个 EDGE 输入边列表（包含普通边与边组的子边引用；顺序即 prompt 拼接顺序）
+→ 1 个 EDGE 输出边列表（包含普通边与边组的子边引用）
+
+状态：关闭 / 激活 / 等待 / 发射
+
+四态语义（四态保留但含义调整，最终口径）：
+①关闭(OFF/IDLE)
+  - 节点不在运行；持续检查“参与的输入边集合”是否就绪。
+  - 参与集合定义：所有输入边中 enabled==true 的边（enabled==false 直接当不存在）。
+  - 就绪条件：参与集合内所有输入边都必须 active==true（各自队列存在未消费消息）。
+
+②激活(ACTIVE/START)
+  - 触发：满足就绪条件后进入激活。
+  - 行为：
+    a) 读取每条参与输入边的【队头/下一条未消费消息】（由 offset 指向）
+    b) 按输入边列表顺序拼接为结构化 prompt（必须标注 edge_id/type/ts）
+    c) 并发启动本节点的 agents tasks（异步）
+
+③等待(WAITING)
+  - 行为：实时监测各 agents task 完成状态。
+  - 退出条件：所有 agents 完成。
+
+④发射(EMIT)
+  - 行为（严格步骤顺序，稳健口径，必须遵守）：
+    0) 前置：所有 agents 已完成（WAITING 退出），本轮输入 prompt 快照已确定。
+    1) 决策输出集合：
+       - 仅向本节点“生效 enabled==true”的输出边/子边发射。
+       - 生效 enabled 的取值以运行时 effective_enabled 为准（考虑 enabled 传播与延迟 disable 规则）。
+    2) 发射输出（enqueue/append）：
+       - 对步骤 1) 中每条输出边/子边，各 enqueue 1 条消息（append JSONL 单行 JSON）。
+       - 每条 enqueue 都必须按“追加写→flush(必要时 fsync)→commit”规则完成后才算成功。
+    3) 原子性边界（必须遵守）：
+       - 只有当“所有目标输出边/子边 enqueue 均已 commit 成功”后，才允许进入输入确认。
+       - 若任意一条输出 enqueue 失败/未 commit：本轮不得对任何输入边 ack_one()（允许重试发射或直接报错退出并由重启重跑）。
+    4) 确认消费（ACK one）：
+       - 对本轮参与的每条输入边执行 ack_one()（推进 offset 仅 1 条）。
+       - ack_one() 必须按“offset 原子更新（临时写入→原子替换）”提交。
+    5) 回到关闭态。
+
+  - 注意：
+    - active 不可手动置位；active 仅由 offset<队列长度自然导出。
+    - 本系统最小保证为 at-least-once：允许重复处理但不允许丢消息；去重/幂等由上层通过 msg_id 或内容哈希实现。
+
+
+提示词构造规则（最终口径）：
+→ 顺序：按节点维护的输入边列表顺序（list index）
+→ 读取：每条输入边读取 offset 指向的队头消息（不是“最新一条/最后一条”）
+→ 格式：结构化块（建议固定格式，便于 agents 解析）
+   [[EDGE:{edge_id} TYPE:{edge_type} TS:{ts}]]
+   {content}
+   [[/EDGE]]
+→ 一致性：快照原则（稳健口径）
+   - snapshot_ts = 开始拼接 prompt 的时间戳
+   - 可读性判定（对每条参与输入边逐条判定）：
+     1) 先按 offset 取“队头/下一条未消费消息” head_msg
+     2) 若 head_msg.ts <= snapshot_ts：本轮可读，纳入 prompt
+     3) 若 head_msg.ts > snapshot_ts：本轮不可读（视为“暂时未就绪”）
+        - 本轮节点不得启动 agents，也不得对任何输入边 ack_one()
+        - 节点保持在 关闭/等待输入 的语义上（等下一次触发时重新取新的 snapshot_ts）
+   - 解释：该规则保持严格 FIFO（永远只读队头），同时保证“拼接过程的快照一致性”。
+   - 注意：active 仍仅由 offset<队列长度导出；“本轮可读性”是额外门槛，不允许为了绕过快照而向后跳读。
+
+消费规则（ACK one）：
+→ 按消息确认（ACK one message）：每轮结束对每条参与输入边 ack_one()，只推进 offset，不重写 JSONL。
+
+
+========================
+NODE2: checkpoint / 检查点
+========================
+
+在 NODE1 基础上增加
+→ 1 个 bool列表 真后继节点开关 true_successors_mask（默认全 false；用于 ChooseEdge 边组，长度=其子边数量）
+→ 1 个 bool列表 假后继节点开关 false_successors_mask（默认全 false；用于 BackEdge 边组，长度=其子边数量）
+
+状态与主流程：同 NODE1（关闭/激活/等待/发射）
+
+额外规则：
+① checkpoint 有权限根据输入改变 true/false 两组 mask（由本节点 agents 按模板输出并解析）
+② 若 checkpoint 的后继节点也是 checkpoint（Node2->Node2），直接报错并拒绝连接
+③ 回滚只允许选择 edge.type==BackEdge 的边（或 BackEdge 边组子边）
+
+checkpoint agents 输出格式（建议固定为 JSON）：
+{
+  "true_successors_mask":  [bool, bool, ...],
+  "false_successors_mask": [bool, bool, ...]
+}
+
+Node2 发射(EMIT) 的严格步骤顺序（稳健口径，必须遵守）：
+0) 前置：所有 agents 已完成（WAITING 退出）。
+1) 解析：解析本节点 agents 的最终输出，得到两组 mask。
+2) 应用 mask：
+   - 对 ChooseEdge 边组：按 true_successors_mask 将未选择的子边 enabled=false；被选择子边 enabled=true（但仍需叠加其自身约束，如 remaining>0 等）。
+   - 对 BackEdge 边组：按 false_successors_mask 将未选择的子边 enabled=false；被选择子边 enabled=true（但 remaining<=0 的子边必须保持 enabled=false，不可被恢复）。
+3) enabled 传播：运行 enabled 传播算法直到达到固定点（见下文），得到本轮“生效的 enabled 子图”。
+4) 发射输出：仅向“传播后 enabled==true”的输出边/子边 enqueue 1 条消息（append JSONL）。
+5) 确认消费：对本轮参与的每条输入边执行 ack_one()（推进 offset）。
+6) 回到关闭态。
+
+约束：Node2 的 mask/传播必须发生在“写输出之前”，否则会把不该走的分支也写入队列。
+
+========================
+
+EDGE类是用于维护工作流程、储存agents输出的类对象，是图论中的E。
+
+最终边类型集合（建议）：
+→ GateEdge（可选保留；如保留，其开关不改变 active 语义）
+→ ChooseEdge（边组管理对象：包含多条“真输出→真输入”的子边）
+→ BackEdge（边组管理对象：包含多条“回滚/假输出→输入”的子边；每条子边独立次数限制）
+注：SyncEdge 已删除。
+
+通用 Edge（或子边）字段（建议）：
+→ 1 个 string edge_id
+→ 1 个 string edge_type（Gate / ChooseSub / BackSub / Normal 等）
+→ 1 个 bool enabled（默认=true；enabled=false 表示运行时忽略）
+→ 1 个 bool active（由队列是否有未消费消息决定；不可手动置位）
+→ 1 个 NODE from
+→ 1 个 NODE to
+→ 1 个 外部队列存储文件（append-only JSONL）
+→ 1 个 消费指针/offset（单独维护，不改写 JSONL）
+
+ChooseEdge（边组对象）
+→ 本质：管理多条子边；每条子边独立 enabled/active/队列/offset。
+→ 选择：checkpoint 输出 true_successors_mask；未被选择的子边 enabled=false。
+
+BackEdge（边组对象）
+→ 本质：管理多条回滚子边；每条子边独立 enabled/active/队列/offset。
+→ 选择：checkpoint 输出 false_successors_mask；未被选择的子边 enabled=false。
+→ 次数限制（最终口径）：每条子边独立 remaining（默认=3）
+   - 每发出 1 次回滚消息（enqueue 1 条回滚消息）remaining -= 1
+   - 当 remaining <= 0：该子边 enabled=false（后续不可再被选择）
+
+
+========================
+外部存储协议（最终确认）
+========================
+
+1) 粒度：每条子边 1 个 JSONL 文件（例如 queues/E{edge_id}.jsonl）
+2) 入队：append-only（追加写一条 JSON 记录）
+3) 出队/确认：ack_one() 仅推进 offset，不物理删除
+4) active 判定：offset < 消息总数 则 active=true，否则 active=false
+
+强制规则（避免崩溃不一致，稳健口径，必须遵守）：
+→ offset 必须独立存放（例如 state/offsets.json 或 SQLite），避免与队列文件竞争写锁。
+→ 追加写入（enqueue/append）提交规则：
+   1) 以“单行 JSON”方式追加写入到队列 JSONL 文件末尾
+   2) 写入完成后必须 flush（必要时 fsync）确保落盘
+   3) 只有 flush 成功后，该消息才视为“已提交”（commit）
+→ ack_one() 提交规则：
+   1) 只推进 offset，不改写 JSONL
+   2) offset 写入必须原子更新：写入临时文件/临时记录 → 原子替换（rename/commit）
+   3) offset 的提交必须发生在：本轮输出 enqueue 全部成功之后（避免“offset 前移但输出未落盘”）
+→ 崩溃恢复最低保证（至少做到）：
+   - 允许“重复处理”但不允许“丢消息”：即 offset 只允许在确认完成后前移；若崩溃发生在 enqueue 已落盘但 offset 未更新，重启后会再次处理/再次发射（由上层幂等策略或 msg_id 去重解决）。
+→ 队列文件末尾若出现半行/损坏行（崩溃导致），读取端必须忽略最后一个不完整 JSON 行（不计入消息总数），保证 offset<总数 的判定稳定。
+
+
+
+========================
+enabled 传播算法（最终版）
+========================
+
+目标：把“未被选择的子分支”从运行时图中移除，避免等待不可达输入。
+
+规则：
+1. 所有 edge/node 保留 enabled。
+2. ChooseEdge 未被选择的子边：仅该子边 enabled=false。
+3. 禁用传播（需实时检查）：
+   - 若某 node 的所有输入边（含所有子边）均 enabled==false，则 node.enabled=false，且该 node 的所有输出边 enabled=false。
+4. 反向恢复：
+   - 若某 node 存在任意输入边 enabled==true，则 node.enabled=true，且该 node 的所有输出边 enabled=true。
+5. 对 enabled==false 的点/边：所有相关操作都 skip。
+   - 但若当前处于 active：采用“延迟 disable”（节点与边都延迟生效）：
+     a) node：允许完成本轮（agents 结束/发射结束/确认消费）后再应用 enabled 变更
+     b) edge：允许完成当前消费/写入边界后再应用 enabled 变更
+
+备注：enabled 可能在运行中 disabled↔enabled 双向切换，实现必须避免传播震荡（稳健口径，必须遵守）：
+A) 计算模型拆分：
+   - local_enabled：边/子边自身的局部约束（例如：mask 选择结果、BackSub.remaining>0、人工禁用等）
+   - propagated_enabled：传播后的生效结果
+   - 传播时对输出边的“生效 enabled”必须按：edge.enabled = local_enabled(edge) AND node.enabled(from)
+B) 传播算法（固定点迭代，直到不再变化）：
+   1) 初始化：对所有 edge/子边先设置 edge.enabled = local_enabled(edge)
+   2) 迭代更新 node.enabled：
+      - node.enabled = OR(所有输入边/子边的 edge.enabled)
+   3) 迭代更新 edge.enabled（输出边）：
+      - 对每条 edge/子边：edge.enabled = local_enabled(edge) AND edge.from.node.enabled
+   4) 重复步骤 2-3，直到一轮迭代中 node.enabled 与 edge.enabled 都不再变化（达到固定点）。
+   5) 去重要求：实现时必须做“变更去重”（例如只把发生变化的对象入队），避免无意义反复计算。
+C) 延迟 disable（与前述规则一致）：
+   - 若 node/edge 处于 active（节点正在本轮运行，或边当前存在待消费/写入边界），则本轮允许其完成手头事务后再切换 enabled 的生效结果。
+   - 可实现为：desired_enabled（传播计算结果）与 effective_enabled（运行时判断用）分离；active 结束后将 effective_enabled 同步到 desired_enabled。
+
+
+
+========================
+前端/后端结构（建议）
+========================
+
+前端可能实现
+→ 展示 Agents 使用状态
+→ 实时动态 DAG 激活图（enabled/active 叠加显示）
+→ Discussion Room（展示各 edge/sub-edge 队列的最新消息与 offset）
+
+后端可能架构 · 文件结构（示例）
+```
+project/
+├── templates/
+│   ├── checkpoint_mask_output_template.md  → checkpoint 必须输出的 mask JSON 模板（系统解析）
+│   ├── edge_prompt_block_template.md       → 节点拼接 prompt 的结构化边消息块格式
+│   └── node_general_output_template.md     → 普通节点/普通 agent 输出建议（系统不解析）
+├── DAG.dot                                  → 静态结构图（建议仅画前向边；回滚边可单独图层显示）
+├── DAG_constructor.py                       → 构造图
+├── 6_obj.py                                 → 定义 Node/Edge/EdgeGroup
+├── /queues
+│   ├── E01.jsonl                            → 每条子边一个 JSONL 队列文件
+│   └── ...
+├── /state
+│   ├── offsets.json                         → 每条子边的 offset
+│   └── ...
+└── /runtime
+    ├── activate.py                          → 运行过程跟踪（node state / enabled / active）
+    └── ...
+```

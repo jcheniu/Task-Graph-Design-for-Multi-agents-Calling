@@ -1,0 +1,46 @@
+# Agents 参考模板（系统会解析的输出部分）
+
+本系统**只有一类**会把 agents 输出当作“系统控制输入”来解析：
+- **NODE2: checkpoint**（检查点）——用于动态选择后继分支 / 回滚分支。
+
+除此之外（普通 NODE1 / NODE2 的正文输出），系统**不会解析结构**，只会把你的输出作为 message.content 写入边队列，供下游节点拼接 prompt 阅读。
+
+
+========================
+A) 你在 checkpoint 中必须输出什么
+========================
+
+当你作为 checkpoint 节点的 agent 运行时，你的最终输出必须是**纯 JSON**（不要 Markdown 代码块、不要解释文字、不要多余字段）：
+
+{
+  "true_successors_mask":  [bool, bool, ...],
+  "false_successors_mask": [bool, bool, ...]
+}
+
+语义：
+- true_successors_mask：对应 ChooseEdge 边组的子边选择结果（“真后继”）。
+- false_successors_mask：对应 BackEdge 边组的子边选择结果（“回滚/假后继”）。
+
+硬规则（必须遵守）：
+1) **只输出 JSON**，输出中不得包含任何前后缀文字。
+2) 两个 mask 的**元素顺序必须严格对齐系统在 prompt 中提供的后继列表顺序**（系统会以固定顺序提供）。
+3) 每个 mask 的长度必须与其对应的“后继列表长度”一致。
+4) 不想选择任何分支时：输出全 false（或系统允许时可输出空数组；若不确定，优先用全 false）。
+5) 不要输出 true/false 之外的值（不要 0/1、不要 "true" 字符串）。
+
+
+========================
+B) 最小可用示例
+========================
+
+示例1：选择第 0、2 条真后继；不选择回滚分支
+{
+  "true_successors_mask":  [true, false, true, false],
+  "false_successors_mask": [false, false]
+}
+
+示例2：不走真后继；选择第 1 条回滚分支
+{
+  "true_successors_mask":  [false, false, false],
+  "false_successors_mask": [false, true, false]
+}
